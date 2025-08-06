@@ -1,0 +1,151 @@
+# Synthetic data generation
+==================================
+# Importing libraries 
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
+from numba import njit
+import statsmodels.api as sm
+from statsmodels.api import OLS
+==================================
+# Configuration
+GRID_SIZE = 10  # 10x10 grid (100 zones)
+DAYS = 90       # 3 months of data
+FREQ = "15T"    # 15-minute intervals
+np.random.seed(42)  # Reproducibility
+
+@njit
+def calculate_vehicle_counts(base_pop, road_quality, temporal_factors, grid_size):
+    vehicle_counts = np.zeros((len(temporal_factors), grid_size, grid_size))
+    for t in range(len(temporal_factors)):
+        for x in range(grid_size):
+            for y in range(grid_size):
+                pop_factor = temporal_factors[t]
+                base_flow = base_pop[x, y] * pop_factor * (0.1 + 0.05 * road_quality[x, y])
+                vehicle_counts[t, x, y] = np.round(np.maximum(10, base_flow * np.random.normal(1, 0.15)))
+    return vehicle_counts
+
+@njit
+def apply_spatial_autocorrelation_numba(values, grid_size, strength=0.3):
+    result = np.zeros_like(values)
+    for t in range(values.shape[0]):
+        for x in range(grid_size):
+            for y in range(grid_size):
+                total, count = 0.0, 0
+                for dx in [-1, 0, 1]:
+                    for dy in [-1, 0, 1]:
+                        if (dx != 0 or dy != 0) and 0 <= x + dx < grid_size and 0 <= y + dy < grid_size:
+                            total += values[t, x + dx, y + dy]
+                            count += 1
+                result[t, x, y] = (1 - strength) * values[t, x, y] + strength * (total / count if count > 0 else values[t, x, y])
+    return np.round(result).astype(np.int32)
+
+def generate_robust_dataset():
+    """Generate synthetic traffic data with guaranteed proper treatment effects"""
+    # 1. Temporal Structure
+    timestamps = pd.date_range("2025-01-01", periods=DAYS*24*4, freq=FREQ)
+    
+    # 2. Spatial Features
+    zones = np.random.choice(['residential','commercial','mixed'], 
+                           size=GRID_SIZE**2, p=[0.6,0.25,0.15])
+    
+    # Road quality: scale from 0.5 (poor) to 2.0 (excellent)
+    road_quality = np.random.uniform(0.5, 2.0, GRID_SIZE**2)
+    
+    # Baseline delays by zone type (minutes)
+    base_delays = {
+        'residential': np.random.normal(5.5, 0.8, GRID_SIZE**2),
+        'commercial': np.random.normal(8.0, 1.2, GRID_SIZE**2),
+        'mixed': np.random.normal(6.5, 1.0, GRID_SIZE**2)
+    }
+    
+    # Base Traffic Parameters
+    base_vehicle_counts = {
+        'residential': np.random.poisson(150, GRID_SIZE**2),
+        'commercial': np.random.poisson(300, GRID_SIZE**2),
+        'mixed': np.random.poisson(220, GRID_SIZE**2)
+    }
+    
+    # Treatment Parameters
+    treatment_effects = {
+        'residential': 0.10,
+        'commercial': 0.15,
+        'mixed': 0.12
+    }
+
+    records = []
+    for t, time in enumerate(timestamps):
+        for z in range(GRID_SIZE**2):
+            # Policy-Driven Treatment Assignment
+            peak = (7 <= time.hour <= 9) or (16 <= time.hour <= 18)
+            weekend = time.weekday() >= 5
+            prob = 0.2 + 0.35*peak - 0.15*weekend + 0.05*(zones[z]=='commercial') + 0.05*(road_quality[z] - 1.0)
+            toll_active = np.random.binomial(1, np.clip(prob, 0.1, 0.7))
+
+            # Traffic calculation
+            hour_factor = 0.8 + 0.4*peak
+            vehicle_count = int(base_vehicle_counts[zones[z]][z] * hour_factor * (0.9 + 0.05 * road_quality[z]) * np.random.uniform(0.9,1.1))
+            
+            # Delay calculation with road quality
+            base_delay = base_delays[zones[z]][z] * (1 + 0.1*np.random.randn()) * (1.2 - 0.1 * road_quality[z])
+            effect = treatment_effects[zones[z]] * toll_active
+            delay = np.clip(base_delay * (1 - effect), 1, 15)
+            
+            # Additional realism
+            rain_effect = np.random.binomial(1, 0.1) * 0.2 * base_delay
+            event_effect = np.random.binomial(1, 0.05) * 0.3 * base_delay
+            final_delay = delay + rain_effect + event_effect
+            
+            records.append({
+                'timestamp': time,
+                'zone_id': f"Z{z//GRID_SIZE}_{z%GRID_SIZE}",
+                'zone_type': zones[z],
+                'vehicle_count': vehicle_count,
+                'base_delay': round(base_delay, 2),
+                'final_delay': round(final_delay, 2),
+                'toll_active': toll_active,
+                'treatment_prob': round(prob, 3),
+                'hour': time.hour,
+                'is_peak': int(peak),
+                'is_weekend': int(weekend),
+                'rain': int(rain_effect > 0),
+                'event': int(event_effect > 0),
+                'road_quality': round(road_quality[z], 2)
+            })
+
+    df = pd.DataFrame(records)
+    
+    # Validation
+    print("=== VALIDATION RESULTS ===")
+    print(f"1. Avg delay (toll=1): {df[df['toll_active']==1]['final_delay'].mean():.2f} min")
+    print(f"2. Avg delay (toll=0): {df[df['toll_active']==0]['final_delay'].mean():.2f} min")
+    print(f"3. Treatment rate: {df['toll_active'].mean():.2%}")
+    print(f"4. Peak activation rate: {df[df['is_peak']==1]['toll_active'].mean():.2%}")
+    print(f"5. Avg delay by road quality:")
+    print(df.groupby(pd.cut(df['road_quality'], bins=[0,1,1.5,2]))['final_delay'].mean())
+    
+    # Statistical validation
+    print("\n=== STATISTICAL TESTS ===")
+    print("Treatment effect significance:")
+    print(OLS.from_formula('final_delay ~ toll_active + road_quality', data=df).fit().summary())
+    
+    # Visualization
+    plt.figure(figsize=(12,6))
+    ax = df.groupby('hour')['toll_active'].mean().plot(kind='bar', color='skyblue')
+    plt.title("Toll Activation Rate by Hour", pad=20)
+    plt.ylabel("Activation Probability")
+    plt.xlabel("Hour of Day")
+    plt.xticks(rotation=0)
+    for p in ax.patches:
+        ax.annotate(f"{p.get_height():.1%}", 
+                    (p.get_x() + p.get_width() / 2., p.get_height()),
+                    ha='center', va='center', xytext=(0, 5), 
+                    textcoords='offset points')
+    plt.tight_layout()
+    plt.show()
+        
+    return df
+
+# Generate and analyze
+traffic_data = generate_robust_dataset()
